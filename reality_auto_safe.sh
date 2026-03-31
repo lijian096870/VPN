@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOCK_FILE="/var/lock/reality_auto_safe.lock"
+
 PORT=443
 SNI="www.microsoft.com"
 TAG="Reality"
@@ -25,6 +27,15 @@ bad_line(){ echo "[FAIL] $*"; VERIFY_FAILED=1; }
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || { err "请用 root 运行"; exit 1; }
+}
+
+acquire_lock() {
+  mkdir -p /var/lock
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    err "检测到另一个脚本实例正在运行：$LOCK_FILE"
+    exit 1
+  fi
 }
 
 apt_prepare() {
@@ -418,6 +429,12 @@ EOF
 }
 
 setup_irqbalance() {
+  local cpu_count
+  cpu_count="$(nproc 2>/dev/null || echo 1)"
+  if [ "$cpu_count" -le 1 ]; then
+    log "单核 VPS，irqbalance 无实际收益，跳过启动"
+    return 0
+  fi
   log "启用 irqbalance"
   systemctl enable irqbalance.service >/dev/null 2>&1 || true
   systemctl restart irqbalance.service >/dev/null 2>&1 || true
@@ -531,26 +548,91 @@ restart_xray() {
   systemctl restart xray.service
 }
 
+service_exists() {
+  local svc="$1"
+  systemctl cat "$svc" >/dev/null 2>&1
+}
+
+service_enabled_state() {
+  local svc="$1"
+  systemctl is-enabled "$svc" 2>/dev/null || true
+}
+
+service_active_state() {
+  local svc="$1"
+  systemctl is-active "$svc" 2>/dev/null || true
+}
+
+service_sub_state() {
+  local svc="$1"
+  systemctl show -p SubState --value "$svc" 2>/dev/null || true
+}
+
+validate_service() {
+  local svc="$1"
+
+  if ! service_exists "$svc"; then
+    bad_line "服务不存在: $svc"
+    return 1
+  fi
+
+  local enabled active sub
+  enabled="$(service_enabled_state "$svc")"
+  active="$(service_active_state "$svc")"
+  sub="$(service_sub_state "$svc")"
+
+  if [ "$enabled" = "enabled" ]; then
+    if [ "$active" = "active" ]; then
+      if [ "$sub" = "exited" ]; then
+        ok_line "开机自启正常: $svc (oneshot/exited)"
+      else
+        ok_line "开机自启正常: $svc (active)"
+      fi
+    elif [ "$sub" = "exited" ]; then
+      ok_line "开机自启正常: $svc (oneshot/exited)"
+    else
+      bad_line "服务存在且已启用，但当前未运行: $svc ($active/$sub)"
+    fi
+  else
+    bad_line "服务存在，但未启用: $svc (${enabled:-unknown})"
+  fi
+}
+
+validate_irqbalance() {
+  if ! service_exists irqbalance.service; then
+    bad_line "服务不存在: irqbalance.service"
+    return 1
+  fi
+
+  if [ "$(nproc 2>/dev/null || echo 1)" -le 1 ]; then
+    ok_line "irqbalance.service 存在；当前单核 VPS，自动退出属正常"
+    return 0
+  fi
+
+  local enabled active sub
+  enabled="$(service_enabled_state irqbalance.service)"
+  active="$(service_active_state irqbalance.service)"
+  sub="$(service_sub_state irqbalance.service)"
+
+  if [ "$enabled" = "enabled" ]; then
+    if [ "$active" = "active" ]; then
+      ok_line "开机自启正常: irqbalance.service (active)"
+    elif [ "$sub" = "exited" ]; then
+      ok_line "开机自启正常: irqbalance.service (oneshot/exited)"
+    else
+      bad_line "irqbalance.service 已启用，但当前未运行: ($active/$sub)"
+    fi
+  else
+    bad_line "irqbalance.service 存在，但未启用: (${enabled:-unknown})"
+  fi
+}
+
 verify_boot_items() {
   log "验证开机自启项"
-  local services=(
-    "xray.service"
-    "fq.service"
-    "net-optimize.service"
-    "irqbalance.service"
-  )
-  local svc
-  for svc in "${services[@]}"; do
-    if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$svc"; then
-      if [ "$(systemctl is-enabled "$svc" 2>/dev/null || true)" = "enabled" ]; then
-        ok_line "开机自启正常: $svc"
-      else
-        bad_line "开机自启未启用: $svc"
-      fi
-    else
-      bad_line "服务不存在: $svc"
-    fi
-  done
+  validate_service xray.service || true
+  validate_service fq.service || true
+  validate_service net-optimize.service || true
+  validate_irqbalance || true
 }
 
 verify_runtime() {
@@ -561,9 +643,36 @@ verify_runtime() {
   [ -n "$iface" ] || { bad_line "网卡识别失败"; return; }
 
   systemctl is-active xray.service >/dev/null 2>&1 && ok_line "Xray 运行正常" || bad_line "Xray 未运行"
-  systemctl is-active fq.service >/dev/null 2>&1 && ok_line "fq 服务正常" || bad_line "fq 服务异常"
-  systemctl is-active net-optimize.service >/dev/null 2>&1 && ok_line "net-optimize 服务正常" || bad_line "net-optimize 服务异常"
-  systemctl is-active irqbalance.service >/dev/null 2>&1 && ok_line "irqbalance 正常" || bad_line "irqbalance 异常"
+
+  if service_exists fq.service; then
+    if [ "$(service_active_state fq.service)" = "active" ] || [ "$(service_sub_state fq.service)" = "exited" ]; then
+      ok_line "fq 服务正常"
+    else
+      bad_line "fq 服务异常"
+    fi
+  else
+    bad_line "fq 服务不存在"
+  fi
+
+  if service_exists net-optimize.service; then
+    if [ "$(service_active_state net-optimize.service)" = "active" ] || [ "$(service_sub_state net-optimize.service)" = "exited" ]; then
+      ok_line "net-optimize 服务正常"
+    else
+      bad_line "net-optimize 服务异常"
+    fi
+  else
+    bad_line "net-optimize 服务不存在"
+  fi
+
+  if service_exists irqbalance.service; then
+    if [ "$(nproc 2>/dev/null || echo 1)" -le 1 ]; then
+      ok_line "irqbalance 单核自动退出属正常"
+    else
+      systemctl is-active irqbalance.service >/dev/null 2>&1 && ok_line "irqbalance 正常" || bad_line "irqbalance 异常"
+    fi
+  else
+    bad_line "irqbalance 服务不存在"
+  fi
 
   ss -lntp | grep -q ":${PORT}" && ok_line "端口监听正常: ${PORT}" || bad_line "端口未监听: ${PORT}"
 
@@ -701,6 +810,7 @@ print_summary() {
 
 main() {
   require_root
+  acquire_lock
   apt_prepare
   install_xray_if_needed
 
