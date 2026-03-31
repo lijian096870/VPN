@@ -4,13 +4,16 @@ set -euo pipefail
 PORT=443
 SNI="www.microsoft.com"
 TAG="Reality"
+
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CFG="/usr/local/etc/xray/config.json"
 REALITY_ENV="/usr/local/etc/xray/reality.env"
+
 SYSCTL_FILE="/etc/sysctl.d/99-reality-opt.conf"
 XRAY_DROPIN_DIR="/etc/systemd/system/xray.service.d"
 XRAY_DROPIN_FILE="${XRAY_DROPIN_DIR}/limit.conf"
 FQ_SERVICE="/etc/systemd/system/fq.service"
+NETOPT_SERVICE="/etc/systemd/system/net-optimize.service"
 
 log(){ echo -e "\033[1;32m[INFO]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -23,7 +26,7 @@ require_root() {
 apt_prepare() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl ca-certificates unzip openssl iproute2 ethtool irqbalance procps util-linux python3
+  apt-get install -y curl ca-certificates unzip openssl iproute2 ethtool irqbalance procps util-linux python3 jq iputils-ping
 }
 
 detect_iface() {
@@ -48,180 +51,274 @@ install_xray_if_needed() {
 }
 
 read_existing_config() {
-  if [ ! -f "$XRAY_CFG" ]; then
-    return 1
-  fi
+  [ -f "$XRAY_CFG" ] || return 1
 
-  python3 - <<PY
-import json, sys
-p = "$XRAY_CFG"
-try:
-    with open(p, "r", encoding="utf-8") as f:
-        c = json.load(f)
-    ib = c["inbounds"][0]
-    uuid = ib["settings"]["clients"][0]["id"]
-    flow = ib["settings"]["clients"][0].get("flow","")
-    port = ib["port"]
-    rs = ib["streamSettings"]["realitySettings"]
-    private_key = rs["privateKey"]
-    short_id = rs["shortIds"][0]
-    sni = rs["serverNames"][0]
-    sec = ib["streamSettings"]["security"]
-    net = ib["streamSettings"]["network"]
-
-    if sec != "reality" or net != "tcp" or port != 443 or flow != "xtls-rprx-vision":
-        sys.exit(2)
-
-    print(uuid)
-    print(private_key)
-    print(short_id)
-    print(sni)
-except Exception:
-    sys.exit(1)
+  python3 - "$XRAY_CFG" > /tmp/reality_existing.$$ <<'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+for inbound in cfg.get("inbounds",[]):
+    if inbound.get("protocol")=="vless":
+        clients=inbound.get("settings",{}).get("clients",[])
+        sid=inbound.get("streamSettings",{}).get("realitySettings",{}).get("shortIds",[""])
+        pk=inbound.get("streamSettings",{}).get("realitySettings",{}).get("privateKey","")
+        if clients:
+            print(clients[0].get("id",""))
+            print(pk)
+            print(sid[0] if sid else "")
+            sys.exit(0)
+sys.exit(1)
 PY
-}
 
-gen_keys() {
-  "$XRAY_BIN" x25519
-}
-
-extract_private_from_keys() {
-  local keys="$1"
-  echo "$keys" | sed -n \
-  's/^PrivateKey:[[:space:]]*//p;
-   s/^Private key:[[:space:]]*//p'
-}
-
-extract_public_from_keys() {
-  local keys="$1"
-  echo "$keys" | sed -n \
-  's/^PublicKey:[[:space:]]*//p;
-   s/^Public key:[[:space:]]*//p;
-   s/^Password (PublicKey):[[:space:]]*//p;
-   s/^Password:[[:space:]]*//p'
-}
-
-load_or_create_reality_creds() {
-  mkdir -p /usr/local/etc/xray
-
-  if read_existing_config >/tmp/reality_existing.$$ 2>/dev/null; then
-    UUID="$(sed -n '1p' /tmp/reality_existing.$$)"
-    PRIVATE_KEY="$(sed -n '2p' /tmp/reality_existing.$$)"
-    SHORT_ID="$(sed -n '3p' /tmp/reality_existing.$$)"
-    rm -f /tmp/reality_existing.$$
-
-    if [ -f "$REALITY_ENV" ]; then
-      # shellcheck disable=SC1090
-      source "$REALITY_ENV" || true
-    fi
-
-    if [ -n "${PUBLIC_KEY:-}" ] && [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
-      log "检测到已成功配置，复用现有 UUID / PrivateKey / PublicKey / ShortID"
-      return
-    fi
-
-    warn "检测到现有 config 已成功配置，将复用 UUID / PrivateKey / ShortID。"
-    warn "未找到旧 PublicKey 记录。不会重生成，避免旧链接失效。"
-    PUBLIC_KEY="${PUBLIC_KEY:-KEEP_YOUR_OLD_PUBLIC_KEY}"
-
-    cat > "$REALITY_ENV" <<ENV
-UUID="${UUID}"
-PRIVATE_KEY="${PRIVATE_KEY}"
-PUBLIC_KEY="${PUBLIC_KEY}"
-SHORT_ID="${SHORT_ID}"
-ENV
-    chmod 600 "$REALITY_ENV"
-    return
-  fi
+  UUID="$(sed -n '1p' /tmp/reality_existing.$$ || true)"
+  PRIVATE_KEY="$(sed -n '2p' /tmp/reality_existing.$$ || true)"
+  SHORT_ID="$(sed -n '3p' /tmp/reality_existing.$$ || true)"
+  rm -f /tmp/reality_existing.$$
 
   if [ -f "$REALITY_ENV" ]; then
     # shellcheck disable=SC1090
     source "$REALITY_ENV" || true
-    if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${PUBLIC_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
-      log "复用 reality.env 里的凭据"
-      return
-    fi
   fi
 
-  log "未检测到成功配置，生成新的 Reality 凭据"
+  if [ -n "${PUBLIC_KEY:-}" ] && [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
+    log "检测到已成功配置，复用现有 UUID / PrivateKey / PublicKey / ShortID"
+    return 0
+  fi
+
+  if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
+    warn "检测到现有 config，复用 UUID / PrivateKey / ShortID"
+    PUBLIC_KEY="${PUBLIC_KEY:-KEEP_YOUR_OLD_PUBLIC_KEY}"
+    cat > "$REALITY_ENV" <<EOF
+UUID="$UUID"
+PRIVATE_KEY="$PRIVATE_KEY"
+PUBLIC_KEY="$PUBLIC_KEY"
+SHORT_ID="$SHORT_ID"
+EOF
+    return 0
+  fi
+
+  return 1
+}
+
+generate_reality_creds() {
+  log "生成 Reality 凭据"
+
   UUID="$($XRAY_BIN uuid)"
-  KEYS="$(gen_keys)"
-  PRIVATE_KEY="$(extract_private_from_keys "$KEYS")"
-  PUBLIC_KEY="$(extract_public_from_keys "$KEYS")"
+  mapfile -t KEYPAIR < <("$XRAY_BIN" x25519)
+  PRIVATE_KEY="$(echo "${KEYPAIR[0]}" | awk '{print $3}')"
+  PUBLIC_KEY="$(echo "${KEYPAIR[1]}" | awk '{print $3}')"
   SHORT_ID="$(openssl rand -hex 8)"
 
-  [ -n "$UUID" ] || { err "UUID 生成失败"; exit 1; }
-  [ -n "$PRIVATE_KEY" ] || { err "PrivateKey 生成失败"; echo "$KEYS"; exit 1; }
-  [ -n "$PUBLIC_KEY" ] || { err "PublicKey 生成失败"; echo "$KEYS"; exit 1; }
-  [ -n "$SHORT_ID" ] || { err "ShortID 生成失败"; exit 1; }
+  cat > "$REALITY_ENV" <<EOF
+UUID="$UUID"
+PRIVATE_KEY="$PRIVATE_KEY"
+PUBLIC_KEY="$PUBLIC_KEY"
+SHORT_ID="$SHORT_ID"
+EOF
+}
 
-  cat > "$REALITY_ENV" <<ENV
-UUID="${UUID}"
-PRIVATE_KEY="${PRIVATE_KEY}"
-PUBLIC_KEY="${PUBLIC_KEY}"
-SHORT_ID="${SHORT_ID}"
-ENV
-  chmod 600 "$REALITY_ENV"
+load_or_create_reality_creds() {
+  if ! read_existing_config; then
+    generate_reality_creds
+  fi
+}
+
+detect_best_cc() {
+  local available
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  if echo "$available" | grep -qw bbr2; then
+    echo "bbr2"
+  elif echo "$available" | grep -qw bbr; then
+    echo "bbr"
+  else
+    echo "cubic"
+  fi
+}
+
+test_mtu_one_target() {
+  local target="$1"
+  local sizes=(1472 1464 1452 1440 1432 1420 1412 1400 1392 1380)
+  local ok_size=""
+  for s in "${sizes[@]}"; do
+    if ping -4 -M do -s "$s" -c 2 -W 1 "$target" >/dev/null 2>&1; then
+      ok_size="$s"
+      break
+    fi
+  done
+  if [ -z "$ok_size" ]; then
+    echo "1500"
+  else
+    echo $((ok_size + 28))
+  fi
+}
+
+detect_best_mtu() {
+  local best=1500
+  local mtu
+
+  for t in 1.1.1.1 8.8.8.8; do
+    mtu="$(test_mtu_one_target "$t")"
+    log "目标 $t 可用 MTU: $mtu"
+    if [ "$mtu" -lt "$best" ]; then
+      best="$mtu"
+    fi
+  done
+
+  [ "$best" -gt 1500 ] && best=1500
+  [ "$best" -lt 1380 ] && best=1400
+  echo "$best"
+}
+
+pick_fast_dns() {
+  local best1="223.5.5.5"
+  local best2="119.29.29.29"
+  local cands=("223.5.5.5" "119.29.29.29" "1.1.1.1" "8.8.8.8")
+  local best_rtt=999999
+  local second_rtt=999999
+  local ip avg
+
+  for ip in "${cands[@]}"; do
+    avg="$(ping -c 3 -W 1 "$ip" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {print int($5)}' || true)"
+    [ -n "$avg" ] || continue
+    if [ "$avg" -lt "$best_rtt" ]; then
+      second_rtt="$best_rtt"
+      best2="$best1"
+      best_rtt="$avg"
+      best1="$ip"
+    elif [ "$avg" -lt "$second_rtt" ] && [ "$ip" != "$best1" ]; then
+      second_rtt="$avg"
+      best2="$ip"
+    fi
+  done
+
+  DNS1="$best1"
+  DNS2="$best2"
+  log "已选择 DNS: $DNS1 $DNS2"
 }
 
 write_xray_config() {
-  [ -f "$XRAY_CFG" ] && cp "$XRAY_CFG" "${XRAY_CFG}.bak.$(date +%s)" || true
+  log "写入 Xray 配置"
 
-  cat > "$XRAY_CFG" <<JSON
+  mkdir -p "$(dirname "$XRAY_CFG")"
+
+  cat > "$XRAY_CFG" <<EOF
 {
-  "inbounds": [{
-    "port": ${PORT},
-    "protocol": "vless",
-    "settings": {
-      "clients": [{
-        "id": "${UUID}",
-        "flow": "xtls-rprx-vision"
-      }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "dest": "${SNI}:443",
-        "xver": 0,
-        "serverNames": ["${SNI}"],
-        "privateKey": "${PRIVATE_KEY}",
-        "shortIds": ["${SHORT_ID}"]
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "${TAG}",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true
+        },
+        "realitySettings": {
+          "show": false,
+          "dest": "${SNI}:443",
+          "xver": 0,
+          "serverNames": [
+            "${SNI}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
+        }
       }
     }
-  }],
-  "outbounds": [{
-    "protocol": "freedom"
-  }]
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {},
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true
+        }
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ]
 }
-JSON
+EOF
+
+  cat > "$REALITY_ENV" <<EOF
+UUID="$UUID"
+PRIVATE_KEY="$PRIVATE_KEY"
+PUBLIC_KEY="$PUBLIC_KEY"
+SHORT_ID="$SHORT_ID"
+EOF
 
   "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null
 }
 
 write_sysctl() {
-  log "写入 sysctl 优化"
-  cat > "$SYSCTL_FILE" <<'SYSCTL'
+  local cc="$1"
+  log "写入 sysctl 优化，拥塞控制: $cc"
+
+  cat > "$SYSCTL_FILE" <<EOF
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.core.netdev_max_backlog=250000
-net.core.somaxconn=65535
+net.ipv4.tcp_congestion_control=${cc}
+
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
+net.core.rmem_default=262144
+net.core.wmem_default=262144
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864
+
+net.core.netdev_max_backlog=16384
+net.core.somaxconn=32768
+net.ipv4.tcp_max_syn_backlog=8192
+
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.ip_local_port_range=10240 65535
+
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
 vm.swappiness=10
+
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
-SYSCTL
+EOF
 
   sysctl --system >/dev/null
+}
+
+apply_mtu_now() {
+  local iface="$1"
+  local mtu="$2"
+  log "应用 MTU: $iface -> $mtu"
+  ip link set dev "$iface" mtu "$mtu"
 }
 
 setup_dns() {
@@ -230,13 +327,13 @@ setup_dns() {
     chattr -i /etc/resolv.conf 2>/dev/null || true
   fi
 
-  cat > /etc/resolv.conf <<RESOLV
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-RESOLV
+  cat > /etc/resolv.conf <<EOF
+nameserver ${DNS1}
+nameserver ${DNS2}
+EOF
 
   if command -v chattr >/dev/null 2>&1; then
-    chattr +i /etc/resolv.conf || true
+    chattr +i /etc/resolv.conf 2>/dev/null || true
   fi
 }
 
@@ -267,6 +364,7 @@ setup_xray_dropin() {
   cat > "$XRAY_DROPIN_FILE" <<'UNIT'
 [Service]
 LimitNOFILE=1048576
+TasksMax=infinity
 Nice=-10
 UNIT
 }
@@ -274,12 +372,10 @@ UNIT
 setup_fq_service() {
   local iface="$1"
   log "设置 fq 开机自启：$iface"
-
-  cat > "$FQ_SERVICE" <<UNIT
+  cat > "$FQ_SERVICE" <<EOF
 [Unit]
-Description=Enable fq qdisc on ${iface}
-After=network-online.target
-Wants=network-online.target
+Description=Apply fq qdisc on boot
+After=network.target
 
 [Service]
 Type=oneshot
@@ -288,11 +384,36 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
 
   systemctl daemon-reload
   systemctl enable fq >/dev/null 2>&1 || true
   systemctl restart fq || true
+}
+
+setup_netopt_service() {
+  local iface="$1"
+  local mtu="$2"
+  log "设置 MTU 开机自启：$iface -> $mtu"
+  cat > "$NETOPT_SERVICE" <<EOF
+[Unit]
+Description=Apply MTU and fq on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip link set dev ${iface} mtu ${mtu}
+ExecStart=/sbin/tc qdisc replace dev ${iface} root fq
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable net-optimize.service >/dev/null 2>&1 || true
+  systemctl restart net-optimize.service || true
 }
 
 stop_conflicting_services() {
@@ -329,15 +450,21 @@ main() {
   IFACE="$(detect_iface)"
   [ -n "$IFACE" ] || { err "无法自动识别网卡"; exit 1; }
 
+  CC="$(detect_best_cc)"
+  BEST_MTU="$(detect_best_mtu)"
+  pick_fast_dns
+
   load_or_create_reality_creds
   write_xray_config
-  write_sysctl
+  write_sysctl "$CC"
+  apply_mtu_now "$IFACE" "$BEST_MTU"
   setup_dns
   setup_irqbalance
   setup_cpu_performance
   disable_unused_services
   setup_xray_dropin
   setup_fq_service "$IFACE"
+  setup_netopt_service "$IFACE" "$BEST_MTU"
   stop_conflicting_services
   open_firewall
   restart_xray
@@ -354,6 +481,9 @@ main() {
   echo "ShortID: $SHORT_ID"
   echo "SNI: $SNI"
   echo "Flow: xtls-rprx-vision"
+  echo "MTU: $BEST_MTU"
+  echo "CC: $CC"
+  echo "DNS: $DNS1 $DNS2"
   echo
   echo "---- 服务状态 ----"
   systemctl status xray --no-pager | sed -n '1,8p'
@@ -362,10 +492,22 @@ main() {
   ss -lntp | grep ":${PORT}" || true
   echo
   echo "---- qdisc ----"
-  tc qdisc show || true
+  tc qdisc show dev "$IFACE" || true
+  echo
+  echo "---- MTU ----"
+  ip link show dev "$IFACE" | head -n1
   echo
   echo "---- 核心 sysctl ----"
-  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_no_metrics_save vm.swappiness
+  sysctl \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_no_metrics_save \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    vm.swappiness
   echo
   echo "---- 小火箭链接(IP版) ----"
   echo "vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
