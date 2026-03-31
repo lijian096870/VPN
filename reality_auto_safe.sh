@@ -9,7 +9,6 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_CFG="/usr/local/etc/xray/config.json"
 REALITY_ENV="/usr/local/etc/xray/reality.env"
 
-SYSCTL_FILE="/etc/sysctl.d/99-reality-opt.conf"
 XRAY_DROPIN_DIR="/etc/systemd/system/xray.service.d"
 XRAY_DROPIN_FILE="${XRAY_DROPIN_DIR}/limit.conf"
 FQ_SERVICE="/etc/systemd/system/fq.service"
@@ -109,11 +108,26 @@ generate_reality_creds() {
 
   UUID="$($XRAY_BIN uuid)"
 
-  local key_output
+  local key_output line
   key_output="$($XRAY_BIN x25519)"
 
-  PRIVATE_KEY="$(printf '%s\n' "$key_output" | awk -F': ' '/^Private[Kk]ey:/ {print $2; exit}' | tr -d '\r')"
-  PUBLIC_KEY="$(printf '%s\n' "$key_output" | awk -F': ' '/^Public[Kk]ey:/ {print $2; exit} /^Password \(PublicKey\):/ {print $2; exit}' | tr -d '\r')"
+  PRIVATE_KEY=""
+  PUBLIC_KEY=""
+
+  while IFS= read -r line; do
+    case "$line" in
+      PrivateKey:*) PRIVATE_KEY="${line#PrivateKey: }" ;;
+      "Private key:"*) PRIVATE_KEY="${line#Private key: }" ;;
+      PublicKey:*) PUBLIC_KEY="${line#PublicKey: }" ;;
+      "Public key:"*) PUBLIC_KEY="${line#Public key: }" ;;
+      "Password (PublicKey):"*) PUBLIC_KEY="${line#Password (PublicKey): }" ;;
+    esac
+  done <<EOF
+$key_output
+EOF
+
+  PRIVATE_KEY="$(printf '%s' "$PRIVATE_KEY" | tr -d '\r\n')"
+  PUBLIC_KEY="$(printf '%s' "$PUBLIC_KEY" | tr -d '\r\n')"
 
   [ -n "$PRIVATE_KEY" ] || { err "PrivateKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
   [ -n "$PUBLIC_KEY" ] || { err "PublicKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
@@ -151,14 +165,12 @@ test_mtu_one_target() {
   local sizes=(1472 1464 1452 1440 1432 1420 1412 1400 1392 1380)
   local ok_size=""
   local s
-
   for s in "${sizes[@]}"; do
     if ping -4 -M do -s "$s" -c 2 -W 1 "$target" >/dev/null 2>&1; then
       ok_size="$s"
       break
     fi
   done
-
   if [ -z "$ok_size" ]; then
     echo "1500"
   else
@@ -170,19 +182,15 @@ detect_best_mtu() {
   local best=1500
   local mtu
   local t
-
   for t in 1.1.1.1 8.8.8.8; do
     mtu="$(test_mtu_one_target "$t" | tail -n1 | tr -d '\r\n' || true)"
     [ -n "$mtu" ] || mtu=1500
-    case "$mtu" in
-      ''|*[!0-9]*) mtu=1500 ;;
-    esac
+    case "$mtu" in ''|*[!0-9]*) mtu=1500 ;; esac
     log "目标 $t 可用 MTU: $mtu"
     if [ "$mtu" -lt "$best" ]; then
       best="$mtu"
     fi
   done
-
   [ "$best" -gt 1500 ] && best=1500
   [ "$best" -lt 1380 ] && best=1400
   echo "$best"
@@ -199,10 +207,7 @@ pick_fast_dns() {
   for ip in "${cands[@]}"; do
     avg="$(ping -c 3 -W 1 "$ip" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {print int($5)}' || true)"
     [ -n "$avg" ] || continue
-    case "$avg" in
-      ''|*[!0-9]*) continue ;;
-    esac
-
+    case "$avg" in ''|*[!0-9]*) continue ;; esac
     if [ "$avg" -lt "$best_rtt" ]; then
       second_rtt="$best_rtt"
       best2="$best1"
@@ -300,11 +305,46 @@ EOF
   "$XRAY_BIN" run -test -config "$XRAY_CFG"
 }
 
+clean_sysctl_d_duplicates() {
+  find /etc/sysctl.d -type f -name '*.conf' -exec sed -i \
+    -e '/^net\.core\.default_qdisc=/d' \
+    -e '/^net\.ipv4\.tcp_congestion_control=/d' \
+    -e '/^net\.core\.rmem_max=/d' \
+    -e '/^net\.core\.wmem_max=/d' \
+    -e '/^net\.core\.rmem_default=/d' \
+    -e '/^net\.core\.wmem_default=/d' \
+    -e '/^net\.ipv4\.tcp_rmem=/d' \
+    -e '/^net\.ipv4\.tcp_wmem=/d' \
+    -e '/^net\.core\.netdev_max_backlog=/d' \
+    -e '/^net\.core\.somaxconn=/d' \
+    -e '/^net\.ipv4\.tcp_max_syn_backlog=/d' \
+    -e '/^net\.ipv4\.tcp_fastopen=/d' \
+    -e '/^net\.ipv4\.tcp_mtu_probing=/d' \
+    -e '/^net\.ipv4\.tcp_slow_start_after_idle=/d' \
+    -e '/^net\.ipv4\.tcp_no_metrics_save=/d' \
+    -e '/^net\.ipv4\.tcp_notsent_lowat=/d' \
+    -e '/^net\.ipv4\.tcp_window_scaling=/d' \
+    -e '/^net\.ipv4\.tcp_timestamps=/d' \
+    -e '/^net\.ipv4\.tcp_sack=/d' \
+    -e '/^net\.ipv4\.ip_local_port_range=/d' \
+    -e '/^net\.ipv4\.tcp_keepalive_time=/d' \
+    -e '/^net\.ipv4\.tcp_keepalive_intvl=/d' \
+    -e '/^net\.ipv4\.tcp_keepalive_probes=/d' \
+    -e '/^vm\.swappiness=/d' \
+    -e '/^net\.ipv6\.conf\.all\.disable_ipv6=/d' \
+    -e '/^net\.ipv6\.conf\.default\.disable_ipv6=/d' \
+    -e '/promote_secondaries/d' \
+    {} \; 2>/dev/null || true
+}
+
 write_sysctl() {
   local cc="$1"
-  log "写入 sysctl 优化，拥塞控制: $cc"
+  log "重建 /etc/sysctl.conf，拥塞控制: $cc"
 
-  cat > "$SYSCTL_FILE" <<EOF
+  cp -f /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%F-%H%M%S)" 2>/dev/null || true
+  clean_sysctl_d_duplicates
+
+  cat > /etc/sysctl.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=${cc}
 
@@ -339,18 +379,14 @@ net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
 
-  find /etc/sysctl.d -type f -name '*.conf' -exec sed -i '/promote_secondaries/d' {} \; 2>/dev/null || true
   sed -i '/promote_secondaries/d' /etc/sysctl.conf 2>/dev/null || true
-
-  sysctl --system >/dev/null || true
+  sysctl -p >/dev/null || true
 }
 
 apply_mtu_now() {
   local iface="$1"
   local mtu="$2"
-  case "$mtu" in
-    ''|*[!0-9]*) err "MTU 值无效: $mtu"; exit 1 ;;
-  esac
+  case "$mtu" in ''|*[!0-9]*) err "MTU 值无效: $mtu"; exit 1 ;; esac
   log "应用 MTU: $iface -> $mtu"
   ip link set dev "$iface" mtu "$mtu"
 }
@@ -360,12 +396,10 @@ setup_dns() {
   if command -v chattr >/dev/null 2>&1; then
     chattr -i /etc/resolv.conf 2>/dev/null || true
   fi
-
   cat > /etc/resolv.conf <<EOF
 nameserver ${DNS1}
 nameserver ${DNS2}
 EOF
-
   if command -v chattr >/dev/null 2>&1; then
     chattr +i /etc/resolv.conf 2>/dev/null || true
   fi
@@ -419,7 +453,6 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable fq >/dev/null 2>&1 || true
   systemctl restart fq || true
@@ -444,7 +477,6 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable net-optimize.service >/dev/null 2>&1 || true
   systemctl restart net-optimize.service || true
