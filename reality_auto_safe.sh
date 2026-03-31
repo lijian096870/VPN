@@ -87,7 +87,11 @@ PY
 
   if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
     warn "检测到现有 config，复用 UUID / PrivateKey / ShortID"
-    PUBLIC_KEY="${PUBLIC_KEY:-KEEP_YOUR_OLD_PUBLIC_KEY}"
+    PUBLIC_KEY="${PUBLIC_KEY:-}"
+    if [ -z "$PUBLIC_KEY" ]; then
+      warn "未能从 reality.env 读取 PublicKey，将重新生成整套凭据"
+      return 1
+    fi
     cat > "$REALITY_ENV" <<EOF
 UUID="$UUID"
 PRIVATE_KEY="$PRIVATE_KEY"
@@ -108,8 +112,8 @@ generate_reality_creds() {
   local key_output
   key_output="$($XRAY_BIN x25519)"
 
-  PRIVATE_KEY="$(printf '%s\n' "$key_output" | sed -n 's/.*Private key: *//p' | head -n1 | tr -d '\r')"
-  PUBLIC_KEY="$(printf '%s\n' "$key_output" | sed -n 's/.*Public key: *//p' | head -n1 | tr -d '\r')"
+  PRIVATE_KEY="$(printf '%s\n' "$key_output" | awk -F': ' '/^Private[Kk]ey:/ {print $2; exit}' | tr -d '\r')"
+  PUBLIC_KEY="$(printf '%s\n' "$key_output" | awk -F': ' '/^Public[Kk]ey:/ {print $2; exit} /^Password \(PublicKey\):/ {print $2; exit}' | tr -d '\r')"
 
   [ -n "$PRIVATE_KEY" ] || { err "PrivateKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
   [ -n "$PUBLIC_KEY" ] || { err "PublicKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
