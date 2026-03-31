@@ -59,8 +59,9 @@ cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
 for inbound in cfg.get("inbounds",[]):
     if inbound.get("protocol")=="vless":
         clients=inbound.get("settings",{}).get("clients",[])
-        sid=inbound.get("streamSettings",{}).get("realitySettings",{}).get("shortIds",[""])
-        pk=inbound.get("streamSettings",{}).get("realitySettings",{}).get("privateKey","")
+        rs=inbound.get("streamSettings",{}).get("realitySettings",{})
+        sid=rs.get("shortIds",[""])
+        pk=rs.get("privateKey","")
         if clients:
             print(clients[0].get("id",""))
             print(pk)
@@ -103,9 +104,16 @@ generate_reality_creds() {
   log "生成 Reality 凭据"
 
   UUID="$($XRAY_BIN uuid)"
-  mapfile -t KEYPAIR < <("$XRAY_BIN" x25519)
-  PRIVATE_KEY="$(echo "${KEYPAIR[0]}" | awk '{print $3}')"
-  PUBLIC_KEY="$(echo "${KEYPAIR[1]}" | awk '{print $3}')"
+
+  local key_output
+  key_output="$($XRAY_BIN x25519)"
+
+  PRIVATE_KEY="$(printf '%s\n' "$key_output" | sed -n 's/.*Private key: *//p' | head -n1 | tr -d '\r')"
+  PUBLIC_KEY="$(printf '%s\n' "$key_output" | sed -n 's/.*Public key: *//p' | head -n1 | tr -d '\r')"
+
+  [ -n "$PRIVATE_KEY" ] || { err "PrivateKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
+  [ -n "$PUBLIC_KEY" ] || { err "PublicKey 生成失败"; printf '%s\n' "$key_output" >&2; exit 1; }
+
   SHORT_ID="$(openssl rand -hex 8)"
 
   cat > "$REALITY_ENV" <<EOF
@@ -138,12 +146,15 @@ test_mtu_one_target() {
   local target="$1"
   local sizes=(1472 1464 1452 1440 1432 1420 1412 1400 1392 1380)
   local ok_size=""
+  local s
+
   for s in "${sizes[@]}"; do
     if ping -4 -M do -s "$s" -c 2 -W 1 "$target" >/dev/null 2>&1; then
       ok_size="$s"
       break
     fi
   done
+
   if [ -z "$ok_size" ]; then
     echo "1500"
   else
@@ -187,6 +198,7 @@ pick_fast_dns() {
     case "$avg" in
       ''|*[!0-9]*) continue ;;
     esac
+
     if [ "$avg" -lt "$best_rtt" ]; then
       second_rtt="$best_rtt"
       best2="$best1"
@@ -205,8 +217,12 @@ pick_fast_dns() {
 
 write_xray_config() {
   log "写入 Xray 配置"
-
   mkdir -p "$(dirname "$XRAY_CFG")"
+
+  [ -n "${UUID:-}" ] || { err "UUID 为空"; exit 1; }
+  [ -n "${PRIVATE_KEY:-}" ] || { err "PRIVATE_KEY 为空"; exit 1; }
+  [ -n "${PUBLIC_KEY:-}" ] || { err "PUBLIC_KEY 为空"; exit 1; }
+  [ -n "${SHORT_ID:-}" ] || { err "SHORT_ID 为空"; exit 1; }
 
   cat > "$XRAY_CFG" <<EOF
 {
@@ -277,7 +293,7 @@ PUBLIC_KEY="$PUBLIC_KEY"
 SHORT_ID="$SHORT_ID"
 EOF
 
-  "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null
+  "$XRAY_BIN" run -test -config "$XRAY_CFG"
 }
 
 write_sysctl() {
