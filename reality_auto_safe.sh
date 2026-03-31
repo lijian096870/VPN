@@ -243,6 +243,9 @@ write_xray_config() {
       "tag": "${TAG}",
       "port": ${PORT},
       "protocol": "vless",
+      "sniffing": {
+        "enabled": false
+      },
       "settings": {
         "clients": [
           {
@@ -257,7 +260,9 @@ write_xray_config() {
         "security": "reality",
         "sockopt": {
           "tcpFastOpen": true,
-          "tcpNoDelay": true
+          "tcpNoDelay": true,
+          "tcpKeepAliveIdle": 300,
+          "mark": 255
         },
         "realitySettings": {
           "show": false,
@@ -278,7 +283,9 @@ write_xray_config() {
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {},
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
       "streamSettings": {
         "sockopt": {
           "tcpFastOpen": true,
@@ -419,6 +426,14 @@ setup_cpu_performance() {
   done
 }
 
+tune_cpu_governor() {
+  log "尝试锁定 CPU performance 模式"
+  for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -f "$f" ] || continue
+    echo performance > "$f" 2>/dev/null || true
+  done
+}
+
 disable_unused_services() {
   log "关闭常见无用服务"
   for svc in bluetooth cups avahi-daemon snapd; do
@@ -427,13 +442,16 @@ disable_unused_services() {
 }
 
 setup_xray_dropin() {
-  log "设置 Xray 句柄/优先级"
+  log "设置 Xray 性能参数"
   mkdir -p "$XRAY_DROPIN_DIR"
   cat > "$XRAY_DROPIN_FILE" <<'UNIT'
 [Service]
 LimitNOFILE=1048576
+LimitNPROC=1048576
 TasksMax=infinity
 Nice=-10
+CPUWeight=90
+IOWeight=90
 UNIT
 }
 
@@ -508,6 +526,255 @@ restart_xray() {
   systemctl restart xray
 }
 
+verify_boot_items() {
+  log "验证开机自启项"
+  local failed=0
+  local svc
+  for svc in xray fq net-optimize.service irqbalance; do
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+      if [ "$(systemctl is-enabled "$svc" 2>/dev/null || true)" = "enabled" ]; then
+        log "自启动已启用: $svc"
+      else
+        warn "自启动未启用: $svc"
+        failed=1
+      fi
+    else
+      warn "服务不存在: $svc"
+      failed=1
+    fi
+  done
+  return $failed
+}
+
+verify_runtime() {
+  log "验证运行状态与配置"
+  local failed=0
+  local iface mtu_now qdisc_now cc_now fq_now dns_cfg
+
+  iface="$(detect_iface)"
+  [ -n "$iface" ] || { err "无法识别网卡"; return 1; }
+
+  if systemctl is-active xray >/dev/null 2>&1; then
+    log "Xray 运行正常"
+  else
+    err "Xray 未运行"
+    failed=1
+  fi
+
+  if systemctl is-active fq >/dev/null 2>&1; then
+    log "fq 服务运行正常"
+  else
+    warn "fq 服务未处于 active"
+    failed=1
+  fi
+
+  if systemctl is-active net-optimize.service >/dev/null 2>&1; then
+    log "net-optimize 服务运行正常"
+  else
+    warn "net-optimize 服务未处于 active"
+    failed=1
+  fi
+
+  if systemctl is-active irqbalance >/dev/null 2>&1; then
+    log "irqbalance 运行正常"
+  else
+    warn "irqbalance 未运行"
+    failed=1
+  fi
+
+  if ss -lntp | grep -q ":${PORT}"; then
+    log "端口监听正常: ${PORT}"
+  else
+    err "端口未监听: ${PORT}"
+    failed=1
+  fi
+
+  mtu_now="$(ip link show dev "$iface" | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')"
+  if [ "${mtu_now:-}" = "${BEST_MTU:-}" ]; then
+    log "MTU 正常: $mtu_now"
+  else
+    warn "MTU 与预期不一致: 当前=${mtu_now:-unknown} 预期=${BEST_MTU:-unknown}"
+    failed=1
+  fi
+
+  qdisc_now="$(tc qdisc show dev "$iface" 2>/dev/null | head -n1 || true)"
+  if echo "$qdisc_now" | grep -q " fq "; then
+    log "qdisc 正常: fq"
+  else
+    warn "qdisc 不是 fq: ${qdisc_now:-none}"
+    failed=1
+  fi
+
+  cc_now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  if [ "${cc_now:-}" = "${CC:-}" ]; then
+    log "拥塞控制正常: $cc_now"
+  else
+    warn "拥塞控制与预期不一致: 当前=${cc_now:-unknown} 预期=${CC:-unknown}"
+    failed=1
+  fi
+
+  fq_now="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  if [ "${fq_now:-}" = "fq" ]; then
+    log "default_qdisc 正常: fq"
+  else
+    warn "default_qdisc 异常: ${fq_now:-unknown}"
+    failed=1
+  fi
+
+  dns_cfg="$(tr '\n' ' ' < /etc/resolv.conf 2>/dev/null || true)"
+  if echo "$dns_cfg" | grep -q "$DNS1" && echo "$dns_cfg" | grep -q "$DNS2"; then
+    log "DNS 配置正常: $DNS1 $DNS2"
+  else
+    warn "DNS 配置与预期不一致"
+    failed=1
+  fi
+
+  if [ -f "$XRAY_CFG" ]; then
+    if "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null 2>&1; then
+      log "Xray 配置测试通过"
+    else
+      err "Xray 配置测试失败"
+      failed=1
+    fi
+  else
+    err "未找到 Xray 配置文件"
+    failed=1
+  fi
+
+  if [ -f "$REALITY_ENV" ]; then
+    # shellcheck disable=SC1090
+    source "$REALITY_ENV" || true
+    if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${PUBLIC_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
+      log "Reality 凭据完整"
+    else
+      err "Reality 凭据不完整"
+      failed=1
+    fi
+  else
+    err "未找到 reality.env"
+    failed=1
+  fi
+
+  python3 - <<PY || failed=1
+import json,sys
+p="${XRAY_CFG}"
+expected_uuid="${UUID}"
+expected_pk="${PRIVATE_KEY}"
+expected_sid="${SHORT_ID}"
+expected_port=${PORT}
+expected_sni="${SNI}"
+try:
+    cfg=json.load(open(p,'r',encoding='utf-8'))
+    assert cfg.get("log",{}).get("loglevel")=="warning"
+
+    ib=cfg["inbounds"][0]
+    assert ib["tag"]=="${TAG}"
+    assert ib["port"]==expected_port
+    assert ib["protocol"]=="vless"
+    assert ib.get("sniffing",{}).get("enabled") is False
+
+    clients=ib["settings"]["clients"]
+    assert clients and clients[0]["id"]==expected_uuid
+    assert clients[0]["flow"]=="xtls-rprx-vision"
+    assert ib["settings"]["decryption"]=="none"
+
+    ss=ib["streamSettings"]
+    assert ss["network"]=="tcp"
+    assert ss["security"]=="reality"
+
+    sock=ss.get("sockopt",{})
+    assert sock.get("tcpFastOpen") is True
+    assert sock.get("tcpNoDelay") is True
+    assert sock.get("tcpKeepAliveIdle")==300
+    assert sock.get("mark")==255
+
+    rs=ss["realitySettings"]
+    assert rs.get("show") is False
+    assert rs.get("dest")==f"{expected_sni}:443"
+    assert rs.get("xver")==0
+    assert expected_sni in rs.get("serverNames",[])
+    assert rs.get("privateKey")==expected_pk
+    assert expected_sid in rs.get("shortIds",[])
+
+    ob0=cfg["outbounds"][0]
+    assert ob0["tag"]=="direct"
+    assert ob0["protocol"]=="freedom"
+    assert ob0["settings"]["domainStrategy"]=="UseIP"
+    osock=ob0.get("streamSettings",{}).get("sockopt",{})
+    assert osock.get("tcpFastOpen") is True
+    assert osock.get("tcpNoDelay") is True
+
+    ob1=cfg["outbounds"][1]
+    assert ob1["tag"]=="block"
+    assert ob1["protocol"]=="blackhole"
+
+    print("OK")
+except Exception as e:
+    print(f"VERIFY_FAIL: {e}")
+    sys.exit(1)
+PY
+
+  local k
+  for k in \
+    net.core.default_qdisc \
+    net.ipv4.tcp_congestion_control \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.core.rmem_default \
+    net.core.wmem_default \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.core.netdev_max_backlog \
+    net.core.somaxconn \
+    net.ipv4.tcp_max_syn_backlog \
+    net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_no_metrics_save \
+    net.ipv4.tcp_notsent_lowat \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_timestamps \
+    net.ipv4.tcp_sack \
+    net.ipv4.ip_local_port_range \
+    net.ipv4.tcp_keepalive_time \
+    net.ipv4.tcp_keepalive_intvl \
+    net.ipv4.tcp_keepalive_probes \
+    vm.swappiness \
+    net.ipv6.conf.all.disable_ipv6 \
+    net.ipv6.conf.default.disable_ipv6
+  do
+    if sysctl "$k" >/dev/null 2>&1; then
+      :
+    else
+      warn "sysctl 项读取失败: $k"
+      failed=1
+    fi
+  done
+
+  return $failed
+}
+
+print_verify_summary() {
+  local iface
+  iface="$(detect_iface)"
+  echo
+  echo "================ 验证结果 ================"
+  echo "xray enabled: $(systemctl is-enabled xray 2>/dev/null || echo no)"
+  echo "xray active : $(systemctl is-active xray 2>/dev/null || echo no)"
+  echo "fq enabled  : $(systemctl is-enabled fq 2>/dev/null || echo no)"
+  echo "fq active   : $(systemctl is-active fq 2>/dev/null || echo no)"
+  echo "net-opt en  : $(systemctl is-enabled net-optimize.service 2>/dev/null || echo no)"
+  echo "net-opt act : $(systemctl is-active net-optimize.service 2>/dev/null || echo no)"
+  echo "irqbalance e: $(systemctl is-enabled irqbalance 2>/dev/null || echo no)"
+  echo "irqbalance a: $(systemctl is-active irqbalance 2>/dev/null || echo no)"
+  echo "cc          : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  echo "qdisc       : $(tc qdisc show dev "$iface" 2>/dev/null | head -n1 || echo none)"
+  echo "mtu         : $(ip link show dev "$iface" | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')"
+  echo "listen      : $(ss -lntp | grep ":${PORT}" || echo none)"
+  echo "dns         : $(tr '\n' ' ' < /etc/resolv.conf 2>/dev/null || echo none)"
+  echo "========================================="
+}
+
 main() {
   require_root
   apt_prepare
@@ -527,6 +794,7 @@ main() {
   setup_dns
   setup_irqbalance
   setup_cpu_performance
+  tune_cpu_governor
   disable_unused_services
   setup_xray_dropin
   setup_fq_service "$IFACE"
@@ -534,6 +802,9 @@ main() {
   stop_conflicting_services
   open_firewall
   restart_xray
+
+  verify_boot_items || warn "部分自启动项验证失败"
+  verify_runtime || warn "部分运行状态验证失败"
 
   SERVER_IP="$(get_server_ip)"
 
@@ -575,8 +846,16 @@ main() {
     net.core.wmem_max \
     vm.swappiness
   echo
+  echo "---- 重启后建议复查 ----"
+  echo "systemctl is-enabled xray fq net-optimize.service irqbalance"
+  echo "systemctl is-active xray fq net-optimize.service irqbalance"
+  echo "tc qdisc show dev $IFACE"
+  echo "ip link show dev $IFACE | head -n1"
+  echo "sysctl net.ipv4.tcp_congestion_control"
+  echo
   echo "---- 小火箭链接(IP版) ----"
   echo "vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
+  print_verify_summary
   echo "======================================"
 }
 
