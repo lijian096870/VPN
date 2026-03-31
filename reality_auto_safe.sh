@@ -15,8 +15,8 @@ XRAY_DROPIN_FILE="${XRAY_DROPIN_DIR}/limit.conf"
 FQ_SERVICE="/etc/systemd/system/fq.service"
 NETOPT_SERVICE="/etc/systemd/system/net-optimize.service"
 
-log(){ echo -e "\033[1;32m[INFO]\033[0m $*"; }
-warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
+log(){ echo -e "\033[1;32m[INFO]\033[0m $*" >&2; }
+warn(){ echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
 
 require_root() {
@@ -154,9 +154,14 @@ test_mtu_one_target() {
 detect_best_mtu() {
   local best=1500
   local mtu
+  local t
 
   for t in 1.1.1.1 8.8.8.8; do
-    mtu="$(test_mtu_one_target "$t")"
+    mtu="$(test_mtu_one_target "$t" | tail -n1 | tr -d '\r\n' || true)"
+    [ -n "$mtu" ] || mtu=1500
+    case "$mtu" in
+      ''|*[!0-9]*) mtu=1500 ;;
+    esac
     log "目标 $t 可用 MTU: $mtu"
     if [ "$mtu" -lt "$best" ]; then
       best="$mtu"
@@ -179,6 +184,9 @@ pick_fast_dns() {
   for ip in "${cands[@]}"; do
     avg="$(ping -c 3 -W 1 "$ip" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/ {print int($5)}' || true)"
     [ -n "$avg" ] || continue
+    case "$avg" in
+      ''|*[!0-9]*) continue ;;
+    esac
     if [ "$avg" -lt "$best_rtt" ]; then
       second_rtt="$best_rtt"
       best2="$best1"
@@ -311,12 +319,18 @@ net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 EOF
 
-  sysctl --system >/dev/null
+  find /etc/sysctl.d -type f -name '*.conf' -exec sed -i '/promote_secondaries/d' {} \; 2>/dev/null || true
+  sed -i '/promote_secondaries/d' /etc/sysctl.conf 2>/dev/null || true
+
+  sysctl --system >/dev/null || true
 }
 
 apply_mtu_now() {
   local iface="$1"
   local mtu="$2"
+  case "$mtu" in
+    ''|*[!0-9]*) err "MTU 值无效: $mtu"; exit 1 ;;
+  esac
   log "应用 MTU: $iface -> $mtu"
   ip link set dev "$iface" mtu "$mtu"
 }
