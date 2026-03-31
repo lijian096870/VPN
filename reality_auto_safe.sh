@@ -178,15 +178,21 @@ detect_best_cc() {
 
 test_mtu_one_target() {
   local target="$1"
-  local sizes=(1472 1464 1452 1440 1432 1420 1412 1400 1392 1380)
+  local low=1352
+  local high=1472
+  local mid
   local ok_size=""
-  local s
-  for s in "${sizes[@]}"; do
-    if ping -4 -M do -s "$s" -c 2 -W 1 "$target" >/dev/null 2>&1; then
-      ok_size="$s"
-      break
+
+  while [ "$low" -le "$high" ]; do
+    mid=$(((low + high) / 2))
+    if ping -4 -M do -s "$mid" -c 2 -W 1 "$target" >/dev/null 2>&1; then
+      ok_size="$mid"
+      low=$((mid + 1))
+    else
+      high=$((mid - 1))
     fi
   done
+
   if [ -z "$ok_size" ]; then
     echo "1500"
   else
@@ -342,6 +348,7 @@ clean_sysctl_d_duplicates() {
     -e '/^net\.core\.somaxconn=/d' \
     -e '/^net\.ipv4\.tcp_max_syn_backlog=/d' \
     -e '/^net\.ipv4\.tcp_fastopen=/d' \
+    -e '/^net\.ipv4\.tcp_ecn=/d' \
     -e '/^net\.ipv4\.tcp_mtu_probing=/d' \
     -e '/^net\.ipv4\.tcp_slow_start_after_idle=/d' \
     -e '/^net\.ipv4\.tcp_no_metrics_save=/d' \
@@ -383,6 +390,7 @@ net.core.somaxconn=32768
 net.ipv4.tcp_max_syn_backlog=8192
 
 net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_ecn=1
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_no_metrics_save=1
@@ -784,6 +792,7 @@ PY
   check_sysctl_eq "net.core.somaxconn" "32768"
   check_sysctl_eq "net.ipv4.tcp_max_syn_backlog" "8192"
   check_sysctl_eq "net.ipv4.tcp_fastopen" "3"
+  check_sysctl_eq "net.ipv4.tcp_ecn" "1"
   check_sysctl_eq "net.ipv4.tcp_mtu_probing" "1"
   check_sysctl_eq "net.ipv4.tcp_slow_start_after_idle" "0"
   check_sysctl_eq "net.ipv4.tcp_no_metrics_save" "1"
