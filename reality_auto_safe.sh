@@ -14,9 +14,14 @@ XRAY_DROPIN_FILE="${XRAY_DROPIN_DIR}/limit.conf"
 FQ_SERVICE="/etc/systemd/system/fq.service"
 NETOPT_SERVICE="/etc/systemd/system/net-optimize.service"
 
+VERIFY_FAILED=0
+
 log(){ echo -e "\033[1;32m[INFO]\033[0m $*" >&2; }
 warn(){ echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 err(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
+
+ok_line(){ echo "[OK] $*"; }
+bad_line(){ echo "[FAIL] $*"; VERIFY_FAILED=1; }
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || { err "请用 root 运行"; exit 1; }
@@ -414,8 +419,8 @@ EOF
 
 setup_irqbalance() {
   log "启用 irqbalance"
-  systemctl enable irqbalance >/dev/null 2>&1 || true
-  systemctl restart irqbalance >/dev/null 2>&1 || true
+  systemctl enable irqbalance.service >/dev/null 2>&1 || true
+  systemctl restart irqbalance.service >/dev/null 2>&1 || true
 }
 
 setup_cpu_performance() {
@@ -436,7 +441,7 @@ tune_cpu_governor() {
 
 disable_unused_services() {
   log "关闭常见无用服务"
-  for svc in bluetooth cups avahi-daemon snapd; do
+  for svc in bluetooth.service cups.service avahi-daemon.service snapd.service; do
     systemctl disable --now "$svc" >/dev/null 2>&1 || true
   done
 }
@@ -472,8 +477,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable fq >/dev/null 2>&1 || true
-  systemctl restart fq || true
+  systemctl enable fq.service >/dev/null 2>&1 || true
+  systemctl restart fq.service || true
 }
 
 setup_netopt_service() {
@@ -501,7 +506,7 @@ EOF
 }
 
 stop_conflicting_services() {
-  for svc in nginx apache2 httpd caddy; do
+  for svc in nginx.service apache2.service httpd.service caddy.service; do
     systemctl stop "$svc" >/dev/null 2>&1 || true
     systemctl disable "$svc" >/dev/null 2>&1 || true
   done
@@ -522,140 +527,84 @@ open_firewall() {
 restart_xray() {
   log "启动 Xray"
   systemctl daemon-reload
-  systemctl enable xray >/dev/null 2>&1 || true
-  systemctl restart xray
+  systemctl enable xray.service >/dev/null 2>&1 || true
+  systemctl restart xray.service
 }
 
 verify_boot_items() {
   log "验证开机自启项"
-  local failed=0
+  local services=(
+    "xray.service"
+    "fq.service"
+    "net-optimize.service"
+    "irqbalance.service"
+  )
   local svc
-  for svc in xray fq net-optimize.service irqbalance; do
-    if systemctl list-unit-files | grep -q "^${svc}"; then
+  for svc in "${services[@]}"; do
+    if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$svc"; then
       if [ "$(systemctl is-enabled "$svc" 2>/dev/null || true)" = "enabled" ]; then
-        log "自启动已启用: $svc"
+        ok_line "开机自启正常: $svc"
       else
-        warn "自启动未启用: $svc"
-        failed=1
+        bad_line "开机自启未启用: $svc"
       fi
     else
-      warn "服务不存在: $svc"
-      failed=1
+      bad_line "服务不存在: $svc"
     fi
   done
-  return $failed
 }
 
 verify_runtime() {
   log "验证运行状态与配置"
-  local failed=0
+
   local iface mtu_now qdisc_now cc_now fq_now dns_cfg
-
   iface="$(detect_iface)"
-  [ -n "$iface" ] || { err "无法识别网卡"; return 1; }
+  [ -n "$iface" ] || { bad_line "网卡识别失败"; return; }
 
-  if systemctl is-active xray >/dev/null 2>&1; then
-    log "Xray 运行正常"
-  else
-    err "Xray 未运行"
-    failed=1
-  fi
+  systemctl is-active xray.service >/dev/null 2>&1 && ok_line "Xray 运行正常" || bad_line "Xray 未运行"
+  systemctl is-active fq.service >/dev/null 2>&1 && ok_line "fq 服务正常" || bad_line "fq 服务异常"
+  systemctl is-active net-optimize.service >/dev/null 2>&1 && ok_line "net-optimize 服务正常" || bad_line "net-optimize 服务异常"
+  systemctl is-active irqbalance.service >/dev/null 2>&1 && ok_line "irqbalance 正常" || bad_line "irqbalance 异常"
 
-  if systemctl is-active fq >/dev/null 2>&1; then
-    log "fq 服务运行正常"
-  else
-    warn "fq 服务未处于 active"
-    failed=1
-  fi
-
-  if systemctl is-active net-optimize.service >/dev/null 2>&1; then
-    log "net-optimize 服务运行正常"
-  else
-    warn "net-optimize 服务未处于 active"
-    failed=1
-  fi
-
-  if systemctl is-active irqbalance >/dev/null 2>&1; then
-    log "irqbalance 运行正常"
-  else
-    warn "irqbalance 未运行"
-    failed=1
-  fi
-
-  if ss -lntp | grep -q ":${PORT}"; then
-    log "端口监听正常: ${PORT}"
-  else
-    err "端口未监听: ${PORT}"
-    failed=1
-  fi
+  ss -lntp | grep -q ":${PORT}" && ok_line "端口监听正常: ${PORT}" || bad_line "端口未监听: ${PORT}"
 
   mtu_now="$(ip link show dev "$iface" | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')"
-  if [ "${mtu_now:-}" = "${BEST_MTU:-}" ]; then
-    log "MTU 正常: $mtu_now"
-  else
-    warn "MTU 与预期不一致: 当前=${mtu_now:-unknown} 预期=${BEST_MTU:-unknown}"
-    failed=1
-  fi
+  [ "${mtu_now:-}" = "${BEST_MTU:-}" ] && ok_line "MTU 正常: $mtu_now" || bad_line "MTU 异常: 当前=${mtu_now:-unknown} 预期=${BEST_MTU:-unknown}"
 
   qdisc_now="$(tc qdisc show dev "$iface" 2>/dev/null | head -n1 || true)"
-  if echo "$qdisc_now" | grep -q " fq "; then
-    log "qdisc 正常: fq"
-  else
-    warn "qdisc 不是 fq: ${qdisc_now:-none}"
-    failed=1
-  fi
+  echo "$qdisc_now" | grep -q " fq " && ok_line "qdisc 正常: fq" || bad_line "qdisc 异常: ${qdisc_now:-none}"
 
   cc_now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  if [ "${cc_now:-}" = "${CC:-}" ]; then
-    log "拥塞控制正常: $cc_now"
-  else
-    warn "拥塞控制与预期不一致: 当前=${cc_now:-unknown} 预期=${CC:-unknown}"
-    failed=1
-  fi
+  [ "${cc_now:-}" = "${CC:-}" ] && ok_line "拥塞控制正常: $cc_now" || bad_line "拥塞控制异常: 当前=${cc_now:-unknown} 预期=${CC:-unknown}"
 
   fq_now="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-  if [ "${fq_now:-}" = "fq" ]; then
-    log "default_qdisc 正常: fq"
-  else
-    warn "default_qdisc 异常: ${fq_now:-unknown}"
-    failed=1
-  fi
+  [ "${fq_now:-}" = "fq" ] && ok_line "default_qdisc 正常: fq" || bad_line "default_qdisc 异常: ${fq_now:-unknown}"
 
   dns_cfg="$(tr '\n' ' ' < /etc/resolv.conf 2>/dev/null || true)"
   if echo "$dns_cfg" | grep -q "$DNS1" && echo "$dns_cfg" | grep -q "$DNS2"; then
-    log "DNS 配置正常: $DNS1 $DNS2"
+    ok_line "DNS 配置正常: $DNS1 $DNS2"
   else
-    warn "DNS 配置与预期不一致"
-    failed=1
+    bad_line "DNS 配置异常"
   fi
 
-  if [ -f "$XRAY_CFG" ]; then
-    if "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null 2>&1; then
-      log "Xray 配置测试通过"
-    else
-      err "Xray 配置测试失败"
-      failed=1
-    fi
+  if [ -f "$XRAY_CFG" ] && "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null 2>&1; then
+    ok_line "Xray 配置测试通过"
   else
-    err "未找到 Xray 配置文件"
-    failed=1
+    bad_line "Xray 配置测试失败"
   fi
 
   if [ -f "$REALITY_ENV" ]; then
     # shellcheck disable=SC1090
     source "$REALITY_ENV" || true
     if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${PUBLIC_KEY:-}" ] && [ -n "${SHORT_ID:-}" ]; then
-      log "Reality 凭据完整"
+      ok_line "Reality 凭据完整"
     else
-      err "Reality 凭据不完整"
-      failed=1
+      bad_line "Reality 凭据不完整"
     fi
   else
-    err "未找到 reality.env"
-    failed=1
+    bad_line "reality.env 不存在"
   fi
 
-  python3 - <<PY || failed=1
+  if python3 - <<PY >/dev/null 2>&1
 import json,sys
 p="${XRAY_CFG}"
 expected_uuid="${UUID}"
@@ -663,115 +612,90 @@ expected_pk="${PRIVATE_KEY}"
 expected_sid="${SHORT_ID}"
 expected_port=${PORT}
 expected_sni="${SNI}"
-try:
-    cfg=json.load(open(p,'r',encoding='utf-8'))
-    assert cfg.get("log",{}).get("loglevel")=="warning"
-
-    ib=cfg["inbounds"][0]
-    assert ib["tag"]=="${TAG}"
-    assert ib["port"]==expected_port
-    assert ib["protocol"]=="vless"
-    assert ib.get("sniffing",{}).get("enabled") is False
-
-    clients=ib["settings"]["clients"]
-    assert clients and clients[0]["id"]==expected_uuid
-    assert clients[0]["flow"]=="xtls-rprx-vision"
-    assert ib["settings"]["decryption"]=="none"
-
-    ss=ib["streamSettings"]
-    assert ss["network"]=="tcp"
-    assert ss["security"]=="reality"
-
-    sock=ss.get("sockopt",{})
-    assert sock.get("tcpFastOpen") is True
-    assert sock.get("tcpNoDelay") is True
-    assert sock.get("tcpKeepAliveIdle")==300
-    assert sock.get("mark")==255
-
-    rs=ss["realitySettings"]
-    assert rs.get("show") is False
-    assert rs.get("dest")==f"{expected_sni}:443"
-    assert rs.get("xver")==0
-    assert expected_sni in rs.get("serverNames",[])
-    assert rs.get("privateKey")==expected_pk
-    assert expected_sid in rs.get("shortIds",[])
-
-    ob0=cfg["outbounds"][0]
-    assert ob0["tag"]=="direct"
-    assert ob0["protocol"]=="freedom"
-    assert ob0["settings"]["domainStrategy"]=="UseIP"
-    osock=ob0.get("streamSettings",{}).get("sockopt",{})
-    assert osock.get("tcpFastOpen") is True
-    assert osock.get("tcpNoDelay") is True
-
-    ob1=cfg["outbounds"][1]
-    assert ob1["tag"]=="block"
-    assert ob1["protocol"]=="blackhole"
-
-    print("OK")
-except Exception as e:
-    print(f"VERIFY_FAIL: {e}")
-    sys.exit(1)
+cfg=json.load(open(p,'r',encoding='utf-8'))
+assert cfg.get("log",{}).get("loglevel")=="warning"
+ib=cfg["inbounds"][0]
+assert ib["tag"]=="${TAG}"
+assert ib["port"]==expected_port
+assert ib["protocol"]=="vless"
+assert ib.get("sniffing",{}).get("enabled") is False
+clients=ib["settings"]["clients"]
+assert clients and clients[0]["id"]==expected_uuid
+assert clients[0]["flow"]=="xtls-rprx-vision"
+assert ib["settings"]["decryption"]=="none"
+ss=ib["streamSettings"]
+assert ss["network"]=="tcp"
+assert ss["security"]=="reality"
+sock=ss.get("sockopt",{})
+assert sock.get("tcpFastOpen") is True
+assert sock.get("tcpNoDelay") is True
+assert sock.get("tcpKeepAliveIdle")==300
+assert sock.get("mark")==255
+rs=ss["realitySettings"]
+assert rs.get("show") is False
+assert rs.get("dest")==f"{expected_sni}:443"
+assert rs.get("xver")==0
+assert expected_sni in rs.get("serverNames",[])
+assert rs.get("privateKey")==expected_pk
+assert expected_sid in rs.get("shortIds",[])
+ob0=cfg["outbounds"][0]
+assert ob0["tag"]=="direct"
+assert ob0["protocol"]=="freedom"
+assert ob0["settings"]["domainStrategy"]=="UseIP"
+osock=ob0.get("streamSettings",{}).get("sockopt",{})
+assert osock.get("tcpFastOpen") is True
+assert osock.get("tcpNoDelay") is True
+ob1=cfg["outbounds"][1]
+assert ob1["tag"]=="block"
+assert ob1["protocol"]=="blackhole"
 PY
+  then
+    ok_line "Xray JSON 关键配置正确"
+  else
+    bad_line "Xray JSON 关键配置异常"
+  fi
 
-  local k
-  for k in \
-    net.core.default_qdisc \
-    net.ipv4.tcp_congestion_control \
-    net.core.rmem_max \
-    net.core.wmem_max \
-    net.core.rmem_default \
-    net.core.wmem_default \
-    net.ipv4.tcp_rmem \
-    net.ipv4.tcp_wmem \
-    net.core.netdev_max_backlog \
-    net.core.somaxconn \
-    net.ipv4.tcp_max_syn_backlog \
-    net.ipv4.tcp_fastopen \
-    net.ipv4.tcp_mtu_probing \
-    net.ipv4.tcp_slow_start_after_idle \
-    net.ipv4.tcp_no_metrics_save \
-    net.ipv4.tcp_notsent_lowat \
-    net.ipv4.tcp_window_scaling \
-    net.ipv4.tcp_timestamps \
-    net.ipv4.tcp_sack \
-    net.ipv4.ip_local_port_range \
-    net.ipv4.tcp_keepalive_time \
-    net.ipv4.tcp_keepalive_intvl \
-    net.ipv4.tcp_keepalive_probes \
-    vm.swappiness \
-    net.ipv6.conf.all.disable_ipv6 \
-    net.ipv6.conf.default.disable_ipv6
-  do
-    if sysctl "$k" >/dev/null 2>&1; then
-      :
-    else
-      warn "sysctl 项读取失败: $k"
-      failed=1
-    fi
-  done
+  check_sysctl_eq() {
+    local key="$1"
+    local expected="$2"
+    local current
+    current="$(sysctl -n "$key" 2>/dev/null || true)"
+    [ "$current" = "$expected" ] && ok_line "sysctl 正常: $key=$expected" || bad_line "sysctl 异常: $key 当前=${current:-unknown} 预期=$expected"
+  }
 
-  return $failed
+  check_sysctl_eq "net.core.default_qdisc" "fq"
+  check_sysctl_eq "net.ipv4.tcp_congestion_control" "$CC"
+  check_sysctl_eq "net.core.rmem_max" "67108864"
+  check_sysctl_eq "net.core.wmem_max" "67108864"
+  check_sysctl_eq "net.core.rmem_default" "262144"
+  check_sysctl_eq "net.core.wmem_default" "262144"
+  check_sysctl_eq "net.ipv4.tcp_rmem" "4096	87380	67108864"
+  check_sysctl_eq "net.ipv4.tcp_wmem" "4096	65536	67108864"
+  check_sysctl_eq "net.core.netdev_max_backlog" "16384"
+  check_sysctl_eq "net.core.somaxconn" "32768"
+  check_sysctl_eq "net.ipv4.tcp_max_syn_backlog" "8192"
+  check_sysctl_eq "net.ipv4.tcp_fastopen" "3"
+  check_sysctl_eq "net.ipv4.tcp_mtu_probing" "1"
+  check_sysctl_eq "net.ipv4.tcp_slow_start_after_idle" "0"
+  check_sysctl_eq "net.ipv4.tcp_no_metrics_save" "1"
+  check_sysctl_eq "net.ipv4.tcp_notsent_lowat" "16384"
+  check_sysctl_eq "net.ipv4.tcp_window_scaling" "1"
+  check_sysctl_eq "net.ipv4.tcp_timestamps" "1"
+  check_sysctl_eq "net.ipv4.tcp_sack" "1"
+  check_sysctl_eq "net.ipv4.ip_local_port_range" "10240	65535"
+  check_sysctl_eq "net.ipv4.tcp_keepalive_time" "600"
+  check_sysctl_eq "net.ipv4.tcp_keepalive_intvl" "30"
+  check_sysctl_eq "net.ipv4.tcp_keepalive_probes" "5"
+  check_sysctl_eq "vm.swappiness" "10"
+  check_sysctl_eq "net.ipv6.conf.all.disable_ipv6" "1"
+  check_sysctl_eq "net.ipv6.conf.default.disable_ipv6" "1"
 }
 
-print_verify_summary() {
-  local iface
-  iface="$(detect_iface)"
+print_summary() {
   echo
-  echo "================ 验证结果 ================"
-  echo "xray enabled: $(systemctl is-enabled xray 2>/dev/null || echo no)"
-  echo "xray active : $(systemctl is-active xray 2>/dev/null || echo no)"
-  echo "fq enabled  : $(systemctl is-enabled fq 2>/dev/null || echo no)"
-  echo "fq active   : $(systemctl is-active fq 2>/dev/null || echo no)"
-  echo "net-opt en  : $(systemctl is-enabled net-optimize.service 2>/dev/null || echo no)"
-  echo "net-opt act : $(systemctl is-active net-optimize.service 2>/dev/null || echo no)"
-  echo "irqbalance e: $(systemctl is-enabled irqbalance 2>/dev/null || echo no)"
-  echo "irqbalance a: $(systemctl is-active irqbalance 2>/dev/null || echo no)"
-  echo "cc          : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-  echo "qdisc       : $(tc qdisc show dev "$iface" 2>/dev/null | head -n1 || echo none)"
-  echo "mtu         : $(ip link show dev "$iface" | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')"
-  echo "listen      : $(ss -lntp | grep ":${PORT}" || echo none)"
-  echo "dns         : $(tr '\n' ' ' < /etc/resolv.conf 2>/dev/null || echo none)"
+  echo "================ 验证总结 ================"
+  [ "$VERIFY_FAILED" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
+  echo "服务自启动/运行、监听、MTU、qdisc、DNS、Reality、Xray、sysctl 已完成检查"
   echo "========================================="
 }
 
@@ -803,60 +727,24 @@ main() {
   open_firewall
   restart_xray
 
-  verify_boot_items || warn "部分自启动项验证失败"
-  verify_runtime || warn "部分运行状态验证失败"
+  verify_boot_items
+  verify_runtime
 
   SERVER_IP="$(get_server_ip)"
 
   echo
-  echo "================ 结果 ================"
-  echo "网卡: $IFACE"
+  echo "================ 部署结果 ================"
   echo "IP: $SERVER_IP"
-  echo "端口: $PORT"
+  echo "PORT: $PORT"
   echo "UUID: $UUID"
   echo "PublicKey: $PUBLIC_KEY"
   echo "ShortID: $SHORT_ID"
   echo "SNI: $SNI"
-  echo "Flow: xtls-rprx-vision"
   echo "MTU: $BEST_MTU"
   echo "CC: $CC"
   echo "DNS: $DNS1 $DNS2"
-  echo
-  echo "---- 服务状态 ----"
-  systemctl status xray --no-pager | sed -n '1,8p'
-  echo
-  echo "---- 监听状态 ----"
-  ss -lntp | grep ":${PORT}" || true
-  echo
-  echo "---- qdisc ----"
-  tc qdisc show dev "$IFACE" || true
-  echo
-  echo "---- MTU ----"
-  ip link show dev "$IFACE" | head -n1
-  echo
-  echo "---- 核心 sysctl ----"
-  sysctl \
-    net.ipv4.tcp_congestion_control \
-    net.core.default_qdisc \
-    net.ipv4.tcp_fastopen \
-    net.ipv4.tcp_mtu_probing \
-    net.ipv4.tcp_slow_start_after_idle \
-    net.ipv4.tcp_no_metrics_save \
-    net.core.rmem_max \
-    net.core.wmem_max \
-    vm.swappiness
-  echo
-  echo "---- 重启后建议复查 ----"
-  echo "systemctl is-enabled xray fq net-optimize.service irqbalance"
-  echo "systemctl is-active xray fq net-optimize.service irqbalance"
-  echo "tc qdisc show dev $IFACE"
-  echo "ip link show dev $IFACE | head -n1"
-  echo "sysctl net.ipv4.tcp_congestion_control"
-  echo
-  echo "---- 小火箭链接(IP版) ----"
-  echo "vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
-  print_verify_summary
-  echo "======================================"
+  echo "LINK: vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
+  print_summary
 }
 
 main "$@"
