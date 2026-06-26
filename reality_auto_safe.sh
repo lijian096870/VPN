@@ -165,13 +165,23 @@ load_or_create_reality_creds() {
 }
 
 detect_best_cc() {
+  # 优先启用 BBR。很多系统默认支持 BBR，但模块未加载；
+  # 如果不先 modprobe，tcp_available_congestion_control 里可能看不到 bbr。
+  modprobe tcp_bbr 2>/dev/null || true
+
+  # 持久化：开机自动加载 BBR 模块
+  mkdir -p /etc/modules-load.d
+  echo tcp_bbr > /etc/modules-load.d/bbr.conf
+
   local available
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
   if echo "$available" | grep -qw bbr2; then
     echo "bbr2"
   elif echo "$available" | grep -qw bbr; then
     echo "bbr"
   else
+    warn "当前内核未检测到 bbr/bbr2，可用拥塞控制: ${available:-unknown}，将回退到 cubic"
     echo "cubic"
   fi
 }
@@ -693,6 +703,16 @@ verify_runtime() {
   cc_now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
   [ "${cc_now:-}" = "${CC:-}" ] && ok_line "拥塞控制正常: $cc_now" || bad_line "拥塞控制异常: 当前=${cc_now:-unknown} 预期=${CC:-unknown}"
 
+  if [ "${CC:-}" = "bbr" ] || [ "${CC:-}" = "bbr2" ]; then
+    if lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
+      ok_line "BBR 模块已加载: tcp_bbr"
+    else
+      bad_line "BBR 模块未加载: tcp_bbr"
+    fi
+  else
+    bad_line "BBR 未启用，当前使用: ${CC:-unknown}"
+  fi
+
   fq_now="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
   [ "${fq_now:-}" = "fq" ] && ok_line "default_qdisc 正常: fq" || bad_line "default_qdisc 异常: ${fq_now:-unknown}"
 
@@ -861,6 +881,7 @@ main() {
   echo "SNI: $SNI"
   echo "MTU: $BEST_MTU"
   echo "CC: $CC"
+  echo "BBR: $([ "$CC" = "bbr" ] || [ "$CC" = "bbr2" ] && echo "enabled" || echo "not enabled")"
   echo "DNS: $DNS1 $DNS2"
   echo "LINK: vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
   print_summary
