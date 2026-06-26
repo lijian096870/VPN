@@ -3,7 +3,7 @@ set -euo pipefail
 
 LOCK_FILE="/var/lock/reality_auto_safe.lock"
 
-PORT=443
+PORT=4488
 SNI="www.microsoft.com"
 TAG="Reality"
 
