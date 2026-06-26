@@ -164,25 +164,53 @@ load_or_create_reality_creds() {
   fi
 }
 
-detect_best_cc() {
-  # 优先启用 BBR。很多系统默认支持 BBR，但模块未加载；
-  # 如果不先 modprobe，tcp_available_congestion_control 里可能看不到 bbr。
-  modprobe tcp_bbr 2>/dev/null || true
+enable_bbr_first_run() {
+  # 第一次执行时：先尝试开启/加载 BBR，再进行后续检测。
+  # 你的 VPS 属于这种情况：未 modprobe 前 available 只有 reno/cubic；modprobe 后才出现 bbr。
+  log "尝试开启 BBR 模块"
 
-  # 持久化：开机自动加载 BBR 模块
   mkdir -p /etc/modules-load.d
   echo tcp_bbr > /etc/modules-load.d/bbr.conf
 
+  if modprobe tcp_bbr 2>/tmp/reality_bbr_modprobe.err; then
+    log "tcp_bbr 模块加载成功"
+  else
+    warn "tcp_bbr 模块加载失败；如果当前内核不支持 BBR，将自动回退到 cubic"
+    [ -s /tmp/reality_bbr_modprobe.err ] && cat /tmp/reality_bbr_modprobe.err >&2 || true
+  fi
+}
+
+detect_best_cc() {
+  # 必须先执行 enable_bbr_first_run，再检测 available，避免误判为只有 cubic。
+  enable_bbr_first_run
+
   local available
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  log "可用拥塞控制算法: ${available:-unknown}"
 
   if echo "$available" | grep -qw bbr2; then
     echo "bbr2"
   elif echo "$available" | grep -qw bbr; then
     echo "bbr"
   else
-    warn "当前内核未检测到 bbr/bbr2，可用拥塞控制: ${available:-unknown}，将回退到 cubic"
+    warn "未检测到 bbr/bbr2，将回退到 cubic"
     echo "cubic"
+  fi
+}
+
+apply_congestion_control_now() {
+  local cc="$1"
+
+  if [ "$cc" = "bbr" ] || [ "$cc" = "bbr2" ]; then
+    modprobe tcp_bbr 2>/dev/null || true
+  fi
+
+  sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+
+  if sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1; then
+    log "已即时应用拥塞控制: $cc"
+  else
+    warn "即时应用拥塞控制失败: $cc"
   fi
 }
 
@@ -421,7 +449,8 @@ net.ipv6.conf.default.disable_ipv6=1
 EOF
 
   sed -i '/promote_secondaries/d' /etc/sysctl.conf 2>/dev/null || true
-  sysctl -p >/dev/null || true
+  # 第一次执行时写入配置后立即应用；如果失败，不中断安装，后续验证会显示 FAIL。
+  sysctl -p >/dev/null 2>&1 || true
 }
 
 apply_mtu_now() {
@@ -703,6 +732,7 @@ verify_runtime() {
   cc_now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
   [ "${cc_now:-}" = "${CC:-}" ] && ok_line "拥塞控制正常: $cc_now" || bad_line "拥塞控制异常: 当前=${cc_now:-unknown} 预期=${CC:-unknown}"
 
+  # 后续检查流程：这里只检查 BBR 是否已经开启，不在验证阶段修改系统。
   if [ "${CC:-}" = "bbr" ] || [ "${CC:-}" = "bbr2" ]; then
     if lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
       ok_line "BBR 模块已加载: tcp_bbr"
@@ -710,7 +740,7 @@ verify_runtime() {
       bad_line "BBR 模块未加载: tcp_bbr"
     fi
   else
-    bad_line "BBR 未启用，当前使用: ${CC:-unknown}"
+    warn "BBR 未启用，当前选择拥塞控制: ${CC:-unknown}"
   fi
 
   fq_now="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
@@ -853,6 +883,7 @@ main() {
   load_or_create_reality_creds
   write_xray_config
   write_sysctl "$CC"
+  apply_congestion_control_now "$CC"
   apply_mtu_now "$IFACE" "$BEST_MTU"
   setup_dns
   setup_irqbalance
@@ -881,7 +912,11 @@ main() {
   echo "SNI: $SNI"
   echo "MTU: $BEST_MTU"
   echo "CC: $CC"
-  echo "BBR: $([ "$CC" = "bbr" ] || [ "$CC" = "bbr2" ] && echo "enabled" || echo "not enabled")"
+  if [ "$CC" = "bbr" ] || [ "$CC" = "bbr2" ]; then
+    echo "BBR: enabled ($CC)"
+  else
+    echo "BBR: not enabled ($CC)"
+  fi
   echo "DNS: $DNS1 $DNS2"
   echo "LINK: vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${TAG}"
   print_summary
