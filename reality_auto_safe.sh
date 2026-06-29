@@ -3,8 +3,8 @@ set -euo pipefail
 
 LOCK_FILE="/var/lock/reality_auto_safe.lock"
 
-PORT=4488
-SNI="www.microsoft.com"
+PORT=443
+SNI="addons.mozilla.org"
 TAG="Reality"
 
 XRAY_BIN="/usr/local/bin/xray"
